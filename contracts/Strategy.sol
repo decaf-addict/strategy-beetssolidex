@@ -80,23 +80,30 @@ contract Strategy is BaseStrategy {
     IBalancerPool public constant beetsLp = IBalancerPool(0xcdE5a11a4ACB4eE4c805352Cec57E236bdBC3837);
     IERC20 public constant beets = IERC20(0xF24Bcf4d1e507740041C9cFd2DddB29585aDCe1e);
     IERC20 public constant wftm = IERC20(0x21be370D5312f44cB42ce377BC9b8a0cEF1A4C83);
+    IBalancerVault  public bVault = IBalancerVault(0x20dd72Ed959b6147912C2e529F0a0C651c33c9ce);
 
-    IBalancerVault public bVault;
+    IAsset[] internal assets;
 
     uint256 public maxSlippageIn; // bips
     uint256 public maxSlippageOut; // bips
 
     uint256 internal constant max = type(uint256).max;
     uint256 internal constant basisOne = 10000;
-    SwapSteps internal swapSteps;
+    uint256 public secs = 1800;
+    uint256 public ago = 0;
 
-    struct SwapSteps {
-        bytes32[] poolIds;
-        IAsset[] assets;
+    modifier isVaultManager {
+        checkVaultManagers();
+        _;
     }
 
-    constructor(address _vault, address _bVault) public BaseStrategy(_vault) {
-        bVault = IBalancerVault(_bVault);
+    function checkVaultManagers() internal {
+        require(msg.sender == vault.governance() || msg.sender == vault.management());
+    }
+
+
+    constructor(address _vault) public BaseStrategy(_vault) {
+        assets = [IAsset(address(wftm)), IAsset(address(beets))];
     }
 
     function name() external view override returns (string memory) {
@@ -140,14 +147,14 @@ contract Strategy is BaseStrategy {
     }
 
     function adjustPosition(uint256 _debtOutstanding) internal override {
-        uint beetsBalance = beets.balanceOf(lpToken);
-        uint fBeetsBalance = fBeets.balanceOf(lpToken);
+        uint beetsBalance = beets.balanceOf(address(beetsLp));
+        uint fBeetsBalance = fBeets.balanceOf(address(beetsLp));
         uint ratioSolidlyPool = beetsBalance.mul(1e18).div(fBeetsBalance);
 
-        _createBeetsLp(balanceOfReward().div(2));
-        _mintFBeets(balanceOfBeetsLp());
-        _lpSolidly();
-        _farmSolidex();
+        _createBeetsLp(balanceOfWant().div(2));
+        _mintFBeets(balanceOfBeetsLp(), true);
+        _lpSolidly(true);
+        _farmSolidex(balanceOfSolidlyLp(), true);
     }
 
     function liquidatePosition(uint256 _amountNeeded) internal override returns (uint256 _liquidatedAmount, uint256 _loss){
@@ -161,7 +168,7 @@ contract Strategy is BaseStrategy {
     }
 
     function liquidateAllPositions() internal override returns (uint256) {
-        _sellBeetsLp();
+        _sellBeetsLp(balanceOfBeetsLp());
         return balanceOfWant();
     }
 
@@ -197,11 +204,21 @@ contract Strategy is BaseStrategy {
     }
 
     function balanceOfSolidlyLpInSolidex() public view returns (uint256 _amount){
-        return lpDepositer.userBalances(address(this), solidlyLp);
+        return lpDepositer.userBalances(address(this), address(solidlyLp));
+    }
+
+    function beetsPerBeetsLp(uint256 _beetsLps) public view returns (uint256 _amount) {
+        IPriceOracle.OracleAverageQuery[] memory queries = new IPriceOracle.OracleAverageQuery[](2);
+        queries[0] = IPriceOracle.OracleAverageQuery(IPriceOracle.Variable.PAIR_PRICE, secs, ago);
+        queries[1] = IPriceOracle.OracleAverageQuery(IPriceOracle.Variable.BPT_PRICE, secs, ago);
+        uint256[] memory results = beetsLp.getTimeWeightedAverage(queries);
+        uint256 wftmPerBeet = results[0];
+        uint256 wftmPerBeetsLp = results[1];
+        return _beetsLps.mul(wftmPerBeetsLp).div(wftmPerBeet);
     }
 
 
-    function createBeetsLp(uint _beets) external onlyVaultManagers {
+    function createBeetsLp(uint _beets) external isVaultManager {
         _createBeetsLp(_beets);
     }
 
@@ -221,17 +238,17 @@ contract Strategy is BaseStrategy {
 
     // one sided exit of beetsLp to beets.
     function _sellBeetsLp(uint256 _beetsLps) internal {
-        _beetsLps = Math.min(_beetsLps, balanceOfBpt());
+        _beetsLps = Math.min(_beetsLps, balanceOfBeetsLp());
         if (_beetsLps > 0) {
             uint256[] memory minAmountsOut = new uint256[](2);
-            minAmountsOut[tokenIndex] = bptsToTokens(_beetsLps).mul(basisOne.sub(maxSlippageOut)).div(basisOne);
-            bytes memory userData = abi.encode(IBalancerVault.ExitKind.EXACT_BPT_IN_FOR_ONE_TOKEN_OUT, _beetsLps, tokenIndex);
+            minAmountsOut[1] = beetsPerBeetsLp(_beetsLps).mul(basisOne.sub(maxSlippageOut)).div(basisOne);
+            bytes memory userData = abi.encode(IBalancerVault.ExitKind.EXACT_BPT_IN_FOR_ONE_TOKEN_OUT, _beetsLps, 1);
             IBalancerVault.ExitPoolRequest memory request = IBalancerVault.ExitPoolRequest(assets, minAmountsOut, userData, false);
             bVault.exitPool(beetsLp.getPoolId(), address(this), address(this), request);
         }
     }
 
-    function mintFBeets(uint _beetsLps, bool _mint) external onlyVaultManagers {
+    function mintFBeets(uint _beetsLps, bool _mint) external isVaultManager {
         _mintFBeets(_beetsLps, _mint);
     }
 
@@ -244,7 +261,7 @@ contract Strategy is BaseStrategy {
         }
     }
 
-    function lpSolidly(bool _createLp) external onlyVaultManagers {
+    function lpSolidly(bool _createLp) external isVaultManager {
         _lpSolidly(_createLp);
     }
 
@@ -267,8 +284,7 @@ contract Strategy is BaseStrategy {
                 address(beets),
                 address(fBeets),
                 false,
-                balanceOfWant(),
-                balanceOfFBeets(),
+                balanceOfSolidlyLp(),
                 0,
                 0,
                 address(this),
@@ -278,7 +294,7 @@ contract Strategy is BaseStrategy {
 
     }
 
-    function farmSolidex(uint _amount, bool _enter) external onlyVaultManagers {
+    function farmSolidex(uint _amount, bool _enter) external isVaultManager {
         _farmSolidex(_amount, _enter);
     }
 
@@ -286,12 +302,12 @@ contract Strategy is BaseStrategy {
     function _farmSolidex(uint _amount, bool _enter) internal {
         if (_enter) {
             lpDepositer.deposit(
-                solidlyLp,
+                address(solidlyLp),
                 _amount
             );
         } else {
             lpDepositer.withdraw(
-                solidlyLp,
+                address(solidlyLp),
                 _amount
             );
         }
@@ -299,7 +315,14 @@ contract Strategy is BaseStrategy {
 
 
     // SETTERS //
-    function setParams(uint256 _maxSlippageIn, uint256 _maxSlippageOut, uint256 _maxSingleDeposit, uint256 _minDepositPeriod) public onlyVaultManagers {
+
+    function setTwapParams(uint256 _secs, uint256 _ago) external isVaultManager {
+        secs = _secs;
+        ago = _ago;
+    }
+
+
+    function setParams(uint256 _maxSlippageIn, uint256 _maxSlippageOut, uint256 _maxSingleDeposit, uint256 _minDepositPeriod) public isVaultManager {
         require(_maxSlippageIn <= basisOne);
         maxSlippageIn = _maxSlippageIn;
 
@@ -307,4 +330,12 @@ contract Strategy is BaseStrategy {
         maxSlippageOut = _maxSlippageOut;
 
     }
+
+    // Balancer requires this contract to be payable, so we add ability to sweep stuck ETH
+    function sweepETH() public onlyGovernance {
+        (bool success,) = governance().call{value : address(this).balance}("");
+        require(success, "eth");
+    }
+
+    receive() external payable {}
 }
