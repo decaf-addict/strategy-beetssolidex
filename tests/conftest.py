@@ -46,7 +46,7 @@ def token():
 
 @pytest.fixture
 def amount(accounts, token, user):
-    amount = 10_000_000 * 10 ** token.decimals()
+    amount = 500_000 * 10 ** token.decimals()
     # In order to get some funds for the token you are about to use,
     # it impersonate an exchange address to use it's funds.
     reserve = accounts.at("0xa2503804ec837D1E4699932D58a3bdB767DeA505", force=True)
@@ -74,4 +74,4 @@ def strategy(strategist, keeper, vault, Strategy, gov):
 
 @pytest.fixture(scope="session")
 def RELATIVE_APPROX():
-    yield 1e-5
+    yield 1e-3

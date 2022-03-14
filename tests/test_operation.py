@@ -4,7 +4,7 @@ import pytest
 
 
 def test_operation(
-    chain, accounts, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX
+        chain, accounts, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX
 ):
     # Deposit to the vault
     user_balance_before = token.balanceOf(user)
@@ -21,14 +21,14 @@ def test_operation(
     strategy.tend()
 
     # withdrawal
-    vault.withdraw({"from": user})
+    vault.withdraw(vault.balanceOf(user), user, 10, {"from": user})
     assert (
-        pytest.approx(token.balanceOf(user), rel=RELATIVE_APPROX) == user_balance_before
+            pytest.approx(token.balanceOf(user), rel=RELATIVE_APPROX) == user_balance_before
     )
 
 
 def test_emergency_exit(
-    chain, accounts, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX
+        chain, accounts, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX
 ):
     # Deposit to the vault
     token.approve(vault.address, amount, {"from": user})
@@ -45,7 +45,7 @@ def test_emergency_exit(
 
 
 def test_profitable_harvest(
-    chain, accounts, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX
+        chain, accounts, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX
 ):
     # Deposit to the vault
     token.approve(vault.address, amount, {"from": user})
@@ -65,13 +65,13 @@ def test_profitable_harvest(
     chain.sleep(3600 * 6)  # 6 hrs needed for profits to unlock
     chain.mine(1)
     profit = token.balanceOf(vault.address)  # Profits go to vault
-    # TODO: Uncomment the lines below
-    # assert token.balanceOf(strategy) + profit > amount
-    # assert vault.pricePerShare() > before_pps
+
+    assert token.balanceOf(strategy) + profit > amount
+    assert vault.pricePerShare() > before_pps
 
 
 def test_change_debt(
-    chain, gov, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX
+        chain, gov, token, vault, strategy, user, strategist, amount, RELATIVE_APPROX
 ):
     # Deposit to the vault and harvest
     token.approve(vault.address, amount, {"from": user})
@@ -88,15 +88,18 @@ def test_change_debt(
     strategy.harvest()
     assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == amount
 
-    # In order to pass this tests, you will need to implement prepareReturn.
-    # TODO: uncomment the following lines.
-    # vault.updateStrategyDebtRatio(strategy.address, 5_000, {"from": gov})
-    # chain.sleep(1)
-    # strategy.harvest()
-    # assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == half
+    vault.updateStrategyDebtRatio(strategy.address, 5_000, {"from": gov})
+    chain.sleep(1)
+    strategy.harvest()
+    assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == half
+
+    vault.updateStrategyDebtRatio(strategy.address, 0, {"from": gov})
+    chain.sleep(1)
+    strategy.harvest()
+    assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == 0
 
 
-def test_sweep(gov, vault, strategy, token, user, amount, weth, weth_amout):
+def test_sweep(gov, vault, strategy, token, user, amount):
     # Strategy want token doesn't work
     token.transfer(strategy, amount, {"from": user})
     assert token.address == strategy.want()
@@ -108,21 +111,9 @@ def test_sweep(gov, vault, strategy, token, user, amount, weth, weth_amout):
     with brownie.reverts("!shares"):
         strategy.sweep(vault.address, {"from": gov})
 
-    # TODO: If you add protected tokens to the strategy.
-    # Protected token doesn't work
-    # with brownie.reverts("!protected"):
-    #     strategy.sweep(strategy.protectedToken(), {"from": gov})
-
-    before_balance = weth.balanceOf(gov)
-    weth.transfer(strategy, weth_amout, {"from": user})
-    assert weth.address != strategy.want()
-    assert weth.balanceOf(user) == 0
-    strategy.sweep(weth, {"from": gov})
-    assert weth.balanceOf(gov) == weth_amout + before_balance
-
 
 def test_triggers(
-    chain, gov, vault, strategy, token, amount, user, weth, weth_amout, strategist
+        chain, gov, vault, strategy, token, amount, user, strategist
 ):
     # Deposit to the vault and harvest
     token.approve(vault.address, amount, {"from": user})

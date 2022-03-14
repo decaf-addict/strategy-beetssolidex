@@ -12,4 +12,6 @@ interface IBeetsBar is IERC20 {
     function leave(uint256 _shareOfFreshBeets) external;
 
     function shareRevenue(uint256 _amount) external;
+
+    function transfer(uint256 _amount, address _to) external;
 }

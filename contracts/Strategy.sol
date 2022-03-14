@@ -67,6 +67,11 @@ interface ILpDepositer {
     function getReward(address[] memory lps) external;
 }
 
+// beets (want) ->
+// sell 1/2 for beetsLp (beetsLp pool) ->
+// mint fBeets (beetsBar) ->
+// mint solidlyLp beets/fBeets (solidly) ->
+// enter farm (solidex)
 contract Strategy is BaseStrategy {
     using SafeERC20 for IERC20;
     using SafeMath for uint256;
@@ -89,7 +94,7 @@ contract Strategy is BaseStrategy {
 
     uint256 internal constant max = type(uint256).max;
     uint256 internal constant basisOne = 10000;
-    uint256 public secs = 1800;
+    uint256 public secs = 180;
     uint256 public ago = 0;
 
     modifier isVaultManager {
@@ -104,6 +109,16 @@ contract Strategy is BaseStrategy {
 
     constructor(address _vault) public BaseStrategy(_vault) {
         assets = [IAsset(address(wftm)), IAsset(address(beets))];
+
+        want.safeApprove(address(bVault), max);
+        beetsLp.approve(address(fBeets), max);
+        want.safeApprove(address(solidlyRouter), max);
+        fBeets.approve(address(solidlyRouter), max);
+        solidlyLp.approve(address(lpDepositer), max);
+        solidlyLp.approve(address(solidlyRouter), max);
+
+        maxSlippageIn = 15;
+        maxSlippageOut = 15;
     }
 
     function name() external view override returns (string memory) {
@@ -112,7 +127,11 @@ contract Strategy is BaseStrategy {
     }
 
     function estimatedTotalAssets() public view override returns (uint256) {
-        return balanceOfWant();
+        uint256 solidlyLps = balanceOfSolidlyLpInSolidex().add(balanceOfSolidlyLp());
+        (uint256 beetsBalance, uint256 fBeetsBalance) = balanceOfConstituents(solidlyLps);
+        // sum of lped fBeets and loose fBeets in strat
+        uint256 beetsFromFBeets = estimateBeetsPerFBeets({_amount : fBeetsBalance.add(balanceOfFBeets()), _reverse : false});
+        return balanceOfWant().add(beetsBalance).add(beetsFromFBeets);
     }
 
     function prepareReturn(uint256 _debtOutstanding) internal override returns (uint256 _profit, uint256 _loss, uint256 _debtPayment){
@@ -147,33 +166,52 @@ contract Strategy is BaseStrategy {
     }
 
     function adjustPosition(uint256 _debtOutstanding) internal override {
-        uint beetsBalance = beets.balanceOf(address(beetsLp));
-        uint fBeetsBalance = fBeets.balanceOf(address(beetsLp));
-        uint ratioSolidlyPool = beetsBalance.mul(1e18).div(fBeetsBalance);
-
-        _createBeetsLp(balanceOfWant().div(2));
-        _mintFBeets(balanceOfBeetsLp(), true);
-        _lpSolidly(true);
-        _farmSolidex(balanceOfSolidlyLp(), true);
+        uint amountToLp;
+        {
+            uint beetsFromFBeets = estimateBeetsPerFBeets({_amount : balanceOfFBeets(), _reverse : false});
+            uint looseBeets = balanceOfWant();
+            uint half = looseBeets.add(beetsFromFBeets).div(2);
+            amountToLp = Math.min(half, looseBeets);
+        }
+        if (amountToLp > 0) {
+            _createBeetsLp({_beets : amountToLp});
+            _beetsBar({_beetsLps : balanceOfBeetsLp(), _mint : true});
+            _lpSolidly({_createLp : true});
+            _farmSolidex({_amount : balanceOfSolidlyLp(), _enter : true});
+        }
     }
 
     function liquidatePosition(uint256 _amountNeeded) internal override returns (uint256 _liquidatedAmount, uint256 _loss){
         uint256 totalAssets = want.balanceOf(address(this));
         if (_amountNeeded > totalAssets) {
-            _liquidatedAmount = totalAssets;
-            _loss = _amountNeeded.sub(totalAssets);
+            uint256 toExit = _amountNeeded.sub(totalAssets).mul(1e18).div(beetsPerSolidlyLp());
+            toExit = Math.min(toExit, balanceOfSolidlyLpInSolidex());
+            _farmSolidex({_amount : toExit, _enter : false});
+            _lpSolidly({_createLp : false});
+            _beetsBar({_beetsLps : balanceOfFBeets(), _mint : false});
+            _sellBeetsLp({_beetsLps : balanceOfBeetsLp()});
+
+            _liquidatedAmount = Math.min(balanceOfWant(), _amountNeeded);
+            _loss = _amountNeeded.sub(_liquidatedAmount);
         } else {
             _liquidatedAmount = _amountNeeded;
         }
     }
 
     function liquidateAllPositions() internal override returns (uint256) {
-        _sellBeetsLp(balanceOfBeetsLp());
+        _farmSolidex({_amount : balanceOfSolidlyLpInSolidex(), _enter : false});
+        _lpSolidly({_createLp : false});
+        _beetsBar({_beetsLps : balanceOfFBeets(), _mint : false});
+        _sellBeetsLp({_beetsLps : balanceOfBeetsLp()});
         return balanceOfWant();
     }
 
 
     function prepareMigration(address _newStrategy) internal override {
+        lpDepositer.withdraw(address(solidlyLp), balanceOfSolidlyLpInSolidex());
+        fBeets.transfer(_newStrategy, balanceOfFBeets());
+        beetsLp.transfer(_newStrategy, balanceOfBeetsLp());
+        solidlyLp.transfer(_newStrategy, balanceOfSolidlyLp());
     }
 
 
@@ -207,14 +245,44 @@ contract Strategy is BaseStrategy {
         return lpDepositer.userBalances(address(this), address(solidlyLp));
     }
 
-    function beetsPerBeetsLp(uint256 _beetsLps) public view returns (uint256 _amount) {
+    function balanceOfConstituents(uint256 _amount) public view returns (uint256 _beets, uint256 _fBeets){
+        (_beets, _fBeets) = ISolidlyRouter(solidlyRouter).quoteRemoveLiquidity(address(beets), address(fBeets), false, _amount);
+    }
+
+    // reverse would estimate fBeets per beets
+    function estimateBeetsPerFBeets(uint256 _amount, bool _reverse) public view returns (uint256){
+        if (_reverse) {
+            // output fbeets
+            return _amount.mul(1e18).div(beetsPerBeetsLp()).mul(1e18).div(beetsLpPerFBeets());
+        } else {
+            // output beets
+            return _amount.mul(beetsLpPerFBeets()).div(1e18).mul(beetsPerBeetsLp()).div(1e18);
+        }
+    }
+
+
+    // @return x beets per beetsLp
+    function beetsPerBeetsLp() public view returns (uint256 _amount) {
         IPriceOracle.OracleAverageQuery[] memory queries = new IPriceOracle.OracleAverageQuery[](2);
         queries[0] = IPriceOracle.OracleAverageQuery(IPriceOracle.Variable.PAIR_PRICE, secs, ago);
         queries[1] = IPriceOracle.OracleAverageQuery(IPriceOracle.Variable.BPT_PRICE, secs, ago);
         uint256[] memory results = beetsLp.getTimeWeightedAverage(queries);
-        uint256 wftmPerBeet = results[0];
+        uint256 wftmPerBeets = results[0];
         uint256 wftmPerBeetsLp = results[1];
-        return _beetsLps.mul(wftmPerBeetsLp).div(wftmPerBeet);
+        return wftmPerBeetsLp.mul(1e18).div(wftmPerBeets);
+    }
+
+    // @return x beetsLps * 1e18 per fBeet
+    function beetsLpPerFBeets() public view returns (uint256 _amount) {
+        uint256 beetsLpLocked = beetsLp.balanceOf(address(fBeets));
+        uint256 totalFBeets = fBeets.totalSupply();
+        return beetsLpLocked.mul(1e18).div(totalFBeets);
+    }
+
+    // @return x beets per solidlyLp
+    function beetsPerSolidlyLp() public view returns (uint256 _amount){
+        (uint256 beets, uint256 fBeets) = balanceOfConstituents(1e18);
+        return beets.add(estimateBeetsPerFBeets({_amount : fBeets, _reverse : false}));
     }
 
 
@@ -222,17 +290,24 @@ contract Strategy is BaseStrategy {
         _createBeetsLp(_beets);
     }
 
+    event Debug(string msg, uint value);
+
     // beets --> beetsLP (beets-wftm lp)
     function _createBeetsLp(uint _beets) internal {
         if (_beets > 0) {
             uint256[] memory maxAmountsIn = new uint256[](2);
-            maxAmountsIn[1] = _beets;
-            uint256 beetsLps = _beets.mul(1e18).div(beetsLp.getRate());
-            uint256 expectedLpsOut = beetsLps.mul(basisOne.sub(maxSlippageIn)).div(basisOne);
+            maxAmountsIn[1] = Math.min(_beets, balanceOfWant());
+            uint256 beetsLps = maxAmountsIn[1].mul(1e18).div(beetsPerBeetsLp());
+            uint256 expectedMinLpsOut = beetsLps.mul(basisOne.sub(maxSlippageIn)).div(basisOne);
 
+            emit Debug("_beets", _beets);
+            emit Debug("maxAmountsIn[1]", maxAmountsIn[1]);
+            emit Debug("beetsLps", beetsLps);
+            emit Debug("expectedMinLpsOut", expectedMinLpsOut);
             bytes memory userData = abi.encode(IBalancerVault.JoinKind.EXACT_TOKENS_IN_FOR_BPT_OUT, maxAmountsIn, 0);
             IBalancerVault.JoinPoolRequest memory request = IBalancerVault.JoinPoolRequest(assets, maxAmountsIn, userData, false);
             bVault.joinPool(beetsLp.getPoolId(), address(this), address(this), request);
+            emit Debug("balanceOfBeetsLp", balanceOfBeetsLp());
         }
     }
 
@@ -241,7 +316,8 @@ contract Strategy is BaseStrategy {
         _beetsLps = Math.min(_beetsLps, balanceOfBeetsLp());
         if (_beetsLps > 0) {
             uint256[] memory minAmountsOut = new uint256[](2);
-            minAmountsOut[1] = beetsPerBeetsLp(_beetsLps).mul(basisOne.sub(maxSlippageOut)).div(basisOne);
+            // calculate min out beets
+            minAmountsOut[1] = _beetsLps.mul(beetsPerBeetsLp()).div(1e18).mul(basisOne.sub(maxSlippageOut)).div(basisOne);
             bytes memory userData = abi.encode(IBalancerVault.ExitKind.EXACT_BPT_IN_FOR_ONE_TOKEN_OUT, _beetsLps, 1);
             IBalancerVault.ExitPoolRequest memory request = IBalancerVault.ExitPoolRequest(assets, minAmountsOut, userData, false);
             bVault.exitPool(beetsLp.getPoolId(), address(this), address(this), request);
@@ -249,15 +325,17 @@ contract Strategy is BaseStrategy {
     }
 
     function mintFBeets(uint _beetsLps, bool _mint) external isVaultManager {
-        _mintFBeets(_beetsLps, _mint);
+        _beetsBar(_beetsLps, _mint);
     }
 
     // when you have beetsLp, you can mint fBeets, or conversely burn fBeets to receive beetsLp
-    function _mintFBeets(uint _beetsLps, bool _mint) internal {
-        if (_mint) {
-            fBeets.enter(_beetsLps);
-        } else {
-            fBeets.leave(_beetsLps);
+    function _beetsBar(uint _beetsLps, bool _mint) internal {
+        if (_beetsLps > 0) {
+            if (_mint) {
+                fBeets.enter(_beetsLps);
+            } else {
+                fBeets.leave(_beetsLps);
+            }
         }
     }
 
@@ -268,30 +346,36 @@ contract Strategy is BaseStrategy {
     // add or remove liquidity into the beets/fBeets pool in Solidly
     function _lpSolidly(bool _createLp) internal {
         if (_createLp) {
-            solidlyRouter.addLiquidity(
-                address(beets),
-                address(fBeets),
-                false,
-                balanceOfWant(),
-                balanceOfFBeets(),
-                0,
-                0,
-                address(this),
-                2 ** 256 - 1
-            );
+            uint256 wants = balanceOfWant();
+            uint256 fBeetsAmount = balanceOfFBeets();
+            if (wants > 0 && fBeetsAmount > 0) {
+                solidlyRouter.addLiquidity(
+                    address(beets),
+                    address(fBeets),
+                    false,
+                    wants,
+                    fBeetsAmount,
+                    0,
+                    0,
+                    address(this),
+                    2 ** 256 - 1
+                );
+            }
         } else {
-            solidlyRouter.removeLiquidity(
-                address(beets),
-                address(fBeets),
-                false,
-                balanceOfSolidlyLp(),
-                0,
-                0,
-                address(this),
-                2 ** 256 - 1
-            );
+            uint256 solidlyLps = balanceOfSolidlyLp();
+            if (solidlyLps > 0) {
+                solidlyRouter.removeLiquidity(
+                    address(beets),
+                    address(fBeets),
+                    false,
+                    solidlyLps,
+                    0,
+                    0,
+                    address(this),
+                    2 ** 256 - 1
+                );
+            }
         }
-
     }
 
     function farmSolidex(uint _amount, bool _enter) external isVaultManager {
@@ -300,16 +384,18 @@ contract Strategy is BaseStrategy {
 
     // Deposit beefs/fBeets lp into Solidex farm (lpDepositer), like entering into MasterChef farm
     function _farmSolidex(uint _amount, bool _enter) internal {
-        if (_enter) {
-            lpDepositer.deposit(
-                address(solidlyLp),
-                _amount
-            );
-        } else {
-            lpDepositer.withdraw(
-                address(solidlyLp),
-                _amount
-            );
+        if (_amount > 0) {
+            if (_enter) {
+                lpDepositer.deposit(
+                    address(solidlyLp),
+                    _amount
+                );
+            } else {
+                lpDepositer.withdraw(
+                    address(solidlyLp),
+                    _amount
+                );
+            }
         }
     }
 
